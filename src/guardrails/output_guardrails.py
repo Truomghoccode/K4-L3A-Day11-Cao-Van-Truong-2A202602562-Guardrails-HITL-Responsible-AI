@@ -5,13 +5,21 @@ Checkpoint 2 — Output Guardrails
   - LLM-as-Judge                          ← optional (không chấm)
 """
 import re
-import textwrap
+import sys
+from pathlib import Path
+
+# Prefer this repository's src directory when this file is run directly.
+_SRC_DIR = str(Path(__file__).resolve().parents[1])
+if _SRC_DIR in sys.path:
+    sys.path.remove(_SRC_DIR)
+sys.path.insert(0, _SRC_DIR)
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -27,6 +35,23 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+PII_PATTERNS = {
+    "vn_phone": re.compile(r"(?<!\d)0\d{9,10}(?!\d)"),
+    "email": re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", re.IGNORECASE),
+    "national_id": re.compile(r"(?<!\d)(?:\d{9}|\d{12})(?!\d)"),
+    "api_key": re.compile(r"\bsk-[A-Za-z0-9_-]+\b", re.IGNORECASE),
+    "password": re.compile(
+        r"\b(?:password|mật\s+khẩu)\s*(?::|=|\bis\b|là)\s*[\"']?[^\s,;.!]+",
+        re.IGNORECASE,
+    ),
+    "api_credential": re.compile(
+        r"\b(?:api[\s_-]*key|access[\s_-]*token)\s*"
+        r"(?::|=|\bis\b|là)\s*[\"']?[^\s,;.!]+",
+        re.IGNORECASE,
+    ),
+}
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -36,24 +61,35 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    if not isinstance(response, str):
+        response = "" if response is None else str(response)
+
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        match_count = sum(1 for _ in pattern.finditer(response))
+        if match_count:
+            issues.append(f"{name}: {match_count} found")
+            redacted = pattern.sub("[REDACTED]", redacted)
+
+    # Also match the demo secrets loaded by core.config. Keep the values out of
+    # issue messages and logs; report only the category and number of matches.
+    demo_secrets = {
+        secret.strip()
+        for secret in DEMO_SECRETS
+        if isinstance(secret, str) and secret.strip()
+    }
+    secret_match_count = 0
+    for secret in sorted(demo_secrets, key=len, reverse=True):
+        secret_pattern = re.compile(re.escape(secret), re.IGNORECASE)
+        matches = list(secret_pattern.finditer(redacted))
         if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            secret_match_count += len(matches)
+            redacted = secret_pattern.sub("[REDACTED]", redacted)
+
+    if secret_match_count:
+        issues.append(f"demo_secret: {secret_match_count} found")
 
     return {
         "safe": len(issues) == 0,
@@ -89,7 +125,8 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
+# Optional only: the required deterministic content filter does not depend on
+# an external judge call. Keep the judge disabled unless explicitly configured.
 # Hint:
 # safety_judge_agent = llm_agent.LlmAgent(
 #     model="gemini-3.5-flash",
@@ -97,7 +134,7 @@ If UNSAFE, add a brief reason on the next line.
 #     instruction=SAFETY_JUDGE_INSTRUCTION,
 # )
 
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = None
 judge_runner = None
 
 
@@ -152,12 +189,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
-        text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
-                if hasattr(part, "text") and part.text:
-                    text += part.text
-        return text
+            parts = [
+                part.text
+                for part in llm_response.content.parts or []
+                if getattr(part, "text", None)
+            ]
+            return "\n".join(parts)
+        return ""
+
+    def _replace_response_text(self, llm_response, text: str):
+        """Return the same ADK response with its user-visible text replaced."""
+        content = types.Content(
+            role="model",
+            parts=[types.Part.from_text(text=text)],
+        )
+        # ADK's LlmResponse is a Pydantic model. Copying it preserves metadata
+        # such as token usage and finish reason while replacing only content.
+        if hasattr(llm_response, "model_copy"):
+            return llm_response.model_copy(update={"content": content})
+
+        # Compatibility fallback for response-like objects without model_copy.
+        llm_response.content = content
+        return llm_response
 
     async def after_model_callback(
         self,
@@ -172,16 +226,26 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if filtered["issues"]:
+            self.redacted_count += 1
+            llm_response = self._replace_response_text(
+                llm_response, filtered["redacted"]
+            )
 
-        return llm_response  # TODO: modify if needed
+        # Optional judge sees the redacted text so detected secrets are not
+        # forwarded to a second model. It is disabled unless an agent exists.
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(filtered["redacted"])
+            if not judge_result.get("safe", True):
+                self.blocked_count += 1
+                llm_response = self._replace_response_text(
+                    llm_response,
+                    "Câu trả lời không thể hiển thị vì chưa vượt qua kiểm tra an toàn. "
+                    "Vui lòng thử lại với câu hỏi khác.",
+                )
+
+        return llm_response
 
 
 # ============================================================
@@ -221,8 +285,4 @@ def load_lab_pii_dataset():
         return json.load(f)
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
     test_content_filter()
